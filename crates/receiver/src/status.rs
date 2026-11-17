@@ -60,6 +60,7 @@ pub enum View {
     /// A table redrawn in place; needs a terminal.
     Table,
     /// No output; the tray icon reads `snapshot` and `take_notes`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Tray,
 }
 
@@ -123,11 +124,13 @@ impl Status {
     }
 
     /// The controllers, ordered by player, and the number of senders.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn snapshot(&self) -> (Vec<Row>, usize) {
         let s = self.0.lock().unwrap();
         (s.rows.clone(), s.senders)
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn take_notes(&self) -> Vec<String> {
         std::mem::take(&mut self.0.lock().unwrap().notes)
     }

@@ -103,6 +103,7 @@ version = "0.1.0"
 name = "padlink-receiver"
 version = "0.1.0"
 dependencies = [
+ "evdev",
  "padlink-proto",
  "vigem-client",
  "windows-sys",

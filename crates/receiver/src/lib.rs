@@ -119,6 +119,7 @@ struct Ready {
     cfg: Config,
     /// `--view`, when given.
     table: Option<bool>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     settings: Option<PathBuf>,
     backend: Backend,
     sock: UdpSocket,
