@@ -21,7 +21,8 @@ const SEQ_RESET_AFTER: Duration = Duration::from_millis(500);
 pub const TICK: Duration = Duration::from_millis(50);
 
 pub struct Config {
-    pub kind: Kind,
+    /// Type of virtual pad to create; `None` picks one per controller.
+    pub pad: Option<Kind>,
     pub port: u16,
     pub deadzone: f32,
     /// How long a disconnected controller keeps its virtual pad and player number.
@@ -42,6 +43,7 @@ struct Seat {
     /// `None` while the controller is away and its place is being held.
     route: Option<Route>,
     away_since: Option<Instant>,
+    kind: Kind,
     /// `None` when the driver refused to create it (e.g. a fifth Xbox pad).
     device: Option<Box<dyn VirtualPad>>,
     last_seq: u16,
@@ -173,7 +175,7 @@ impl Engine {
         }
 
         let player = (1..=u8::MAX).find(|n| self.seats.values().all(|s| s.player != *n)).unwrap_or(u8::MAX);
-        let kind = self.cfg.kind;
+        let kind = self.cfg.pad.unwrap_or_else(|| self.pick_kind(&info));
         let device = match self.backend.plug(kind) {
             Ok(d) => {
                 self.log(format!(
@@ -197,6 +199,7 @@ impl Engine {
                 player,
                 route: Some(route),
                 away_since: None,
+                kind,
                 device,
                 last_seq: 0,
                 // Far enough back that the first state is accepted whatever its number.
@@ -211,6 +214,19 @@ impl Engine {
                 stale: 0,
             },
         );
+    }
+
+    /// PlayStation controllers become DualShock 4 pads, so games show the right
+    /// button glyphs; everything else becomes an Xbox 360 pad, which every game
+    /// understands. XInput stops at four Xbox pads, so a fifth becomes a DS4 too.
+    fn pick_kind(&self, info: &PadInfo) -> Kind {
+        const SONY: u16 = 0x054c;
+        let xbox_pads = self.seats.values().filter(|s| s.kind == Kind::X360 && s.device.is_some()).count();
+        if info.vendor == SONY || xbox_pads >= 4 {
+            Kind::Ds4
+        } else {
+            Kind::X360
+        }
     }
 
     fn on_state(&mut self, route: Route, seq: u16, battery: u8, mut pad: PadState) {

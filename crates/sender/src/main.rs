@@ -131,8 +131,13 @@ fn main() {
 /// every second. Handy for checking the whole chain without a controller.
 fn test_pattern(link: &net::Link, n: u32) -> ! {
     use padlink_proto::{btn, fnv1a64, Name, PadInfo, PadState, BATTERY_UNKNOWN, BUS_UNKNOWN};
-    let name = format!("Test pattern {n}");
-    let info = PadInfo { bus: BUS_UNKNOWN, vendor: 0, product: 0, uid: fnv1a64(name.as_bytes()), name: Name::new(&name) };
+    // Instances 50 and up pose as a PlayStation controller.
+    let (name, vendor, product) = if n >= 50 {
+        (format!("Test pattern {n} (DualSense)"), 0x054c, 0x0ce6)
+    } else {
+        (format!("Test pattern {n}"), 0, 0)
+    };
+    let info = PadInfo { bus: BUS_UNKNOWN, vendor, product, uid: fnv1a64(name.as_bytes()), name: Name::new(&name) };
     let start = std::time::Instant::now();
     let mut seq = 0u16;
     let mut info_sent: Option<std::time::Instant> = None;
