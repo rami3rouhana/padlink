@@ -24,12 +24,13 @@ USAGE: padlink-receiver [OPTIONS]
                      games already apply their own)
   --hold <seconds>   how long a disconnected controller keeps its virtual pad
                      and player number, waiting for it to return (default 120)
+  --key <passphrase> only accept senders started with the same --key
   --dry-run          do not create virtual controllers, just print what arrives
   -v, --verbose      print per-controller packet statistics every 5 s
   -h, --help         this text";
 
 fn parse_args() -> Result<Config, String> {
-    let mut cfg = Config { pad: None, port: DEFAULT_PORT, deadzone: 0.0, hold: std::time::Duration::from_secs(120), dry_run: false, verbose: false };
+    let mut cfg = Config { pad: None, port: DEFAULT_PORT, deadzone: 0.0, hold: std::time::Duration::from_secs(120), auth: padlink_proto::Auth::none(), dry_run: false, verbose: false };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -52,6 +53,7 @@ fn parse_args() -> Result<Config, String> {
             "--hold" => {
                 cfg.hold = std::time::Duration::from_secs(value("--hold")?.parse().map_err(|_| "invalid --hold")?)
             }
+            "--key" => cfg.auth = padlink_proto::Auth::from_passphrase(&value("--key")?),
             "--dry-run" => cfg.dry_run = true,
             "-v" | "--verbose" => cfg.verbose = true,
             "-h" | "--help" => {

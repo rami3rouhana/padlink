@@ -19,6 +19,7 @@ pub const INFO_EVERY: Duration = Duration::from_secs(1);
 pub struct Config {
     pub port: u16,
     pub target: Option<std::net::SocketAddr>,
+    pub auth: padlink_proto::Auth,
     pub grab: bool,
     pub swap_xy: Option<bool>,
     pub test_pattern: Option<u32>,
@@ -31,7 +32,9 @@ padlink-sender - stream game controllers to a padlink-receiver on the LAN
 USAGE: padlink-sender [OPTIONS]
 
   --port <N>         UDP port (default 9977)
-  --target <IP>      skip auto-discovery and send to this address
+  --target <IP>      look for the receiver at this address instead of
+                     broadcasting (for networks that block broadcast)
+  --key <passphrase> shared key; must match the receiver's --key
   --grab             take exclusive control of the controllers, so Batocera
                      itself does not react to them while they are streamed
   --swap-xy <on|off> force the X/Y (square/triangle) swap instead of auto-detecting
@@ -45,6 +48,7 @@ fn parse_args() -> Result<Config, String> {
     let mut cfg = Config {
         port: padlink_proto::DEFAULT_PORT,
         target: None,
+        auth: padlink_proto::Auth::none(),
         grab: false,
         swap_xy: None,
         test_pattern: None,
@@ -57,6 +61,7 @@ fn parse_args() -> Result<Config, String> {
         match a.as_str() {
             "--port" => cfg.port = value("--port")?.parse().map_err(|_| "invalid --port")?,
             "--target" => target_host = Some(value("--target")?),
+            "--key" => cfg.auth = padlink_proto::Auth::from_passphrase(&value("--key")?),
             "--grab" => cfg.grab = true,
             "--swap-xy" => {
                 cfg.swap_xy = Some(match value("--swap-xy")?.as_str() {

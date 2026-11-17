@@ -5,7 +5,7 @@
 //! same loop iteration, and only the newest state per controller ever matters.
 
 use crate::vpad::{Backend, Kind, VirtualPad};
-use padlink_proto::{deadzone, seq_newer, Packet, PadInfo, PadState, BATTERY_UNKNOWN, MAX_PACKET};
+use padlink_proto::{deadzone, is_handshake, seq_newer, Auth, Packet, PadInfo, PadState, BATTERY_UNKNOWN, MAX_PACKET};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ pub struct Config {
     pub deadzone: f32,
     /// How long a disconnected controller keeps its virtual pad and player number.
     pub hold: Duration,
+    /// Shared key; packets without a valid tag are ignored when set.
+    pub auth: Auth,
     pub dry_run: bool,
     pub verbose: bool,
 }
@@ -97,6 +99,12 @@ const PING_EVERY: Duration = Duration::from_secs(1);
 /// A sender that has been silent this long is forgotten.
 const SENDER_GONE_AFTER: Duration = Duration::from_secs(10);
 
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    // Seeded by the OS for every `RandomState`.
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
 /// Formats microseconds as milliseconds, e.g. "0.4 ms".
 pub fn ms(us: u32) -> String {
     if us < 10_000 {
@@ -114,6 +122,10 @@ pub struct Engine {
     seats: HashMap<u64, Seat>,
     routes: HashMap<Route, u64>,
     senders: HashMap<SocketAddr, Sender>,
+    /// Random per run; senders must mix it into their authentication tags.
+    nonce: u64,
+    /// Addresses already reported for using a wrong key.
+    rejected: Vec<std::net::IpAddr>,
     last_tick: Instant,
     last_ping: Instant,
     started: Instant,
@@ -130,6 +142,8 @@ impl Engine {
             seats: HashMap::new(),
             routes: HashMap::new(),
             senders: HashMap::new(),
+            nonce: random_u64(),
+            rejected: Vec::new(),
             last_tick: Instant::now(),
             last_ping: Instant::now(),
             started: Instant::now(),
@@ -143,8 +157,12 @@ impl Engine {
             // Errors here are read timeouts, or Windows reporting an ICMP
             // "port unreachable" from an earlier reply. Neither is fatal.
             if let Ok((n, from)) = self.sock.recv_from(&mut buf) {
-                if let Some(p) = Packet::decode(&buf[..n]) {
-                    self.on_packet(p, from);
+                let d = &buf[..n];
+                // The discovery exchange happens before the sender knows our nonce.
+                let nonce = if is_handshake(d) { 0 } else { self.nonce };
+                match self.cfg.auth.open(nonce, d) {
+                    Some(p) => self.on_packet(p, from),
+                    None => self.on_rejected(d, from),
                 }
             }
             if self.last_tick.elapsed() >= TICK {
@@ -160,7 +178,22 @@ impl Engine {
 
     fn send(&self, p: Packet, to: SocketAddr) {
         let mut buf = [0u8; MAX_PACKET];
-        let _ = self.sock.send_to(p.encode(&mut buf), to);
+        let nonce = if matches!(p, Packet::Offer { .. }) { 0 } else { self.nonce };
+        let _ = self.sock.send_to(self.cfg.auth.seal(nonce, &p, &mut buf), to);
+    }
+
+    /// Says so, once per address, when something that looks like padlink
+    /// traffic fails authentication - almost always a mistyped key.
+    fn on_rejected(&mut self, d: &[u8], from: SocketAddr) {
+        // Right after a restart, senders still sign with the previous run's nonce
+        // for up to a second; only the handshake tells us the key itself is wrong.
+        if !self.cfg.auth.enabled() || !is_handshake(d) || Packet::decode(d).is_none() {
+            return;
+        }
+        if !self.rejected.contains(&from.ip()) {
+            self.rejected.push(from.ip());
+            self.log(format!("! ignoring the sender at {}: it uses a different key, or none", from.ip()));
+        }
     }
 
     fn on_packet(&mut self, p: Packet, from: SocketAddr) {
@@ -173,7 +206,7 @@ impl Engine {
             }
         }
         match p {
-            Packet::Discover => self.send(Packet::Offer { nonce: 0 }, from),
+            Packet::Discover => self.send(Packet::Offer { nonce: self.nonce }, from),
             Packet::Info { slot, info } => self.on_info((from, slot), info),
             Packet::State { slot, seq, battery, pad } => self.on_state((from, slot), seq, battery, pad),
             Packet::Gone { slot } => {

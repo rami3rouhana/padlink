@@ -1,10 +1,10 @@
 //! UDP link to the receiver, including zero-config discovery.
 
 use crate::Config;
-use padlink_proto::{Packet, PadInfo, PadState, MAX_PACKET};
+use padlink_proto::{is_handshake, Auth, Packet, PadInfo, PadState, MAX_PACKET};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,12 +12,21 @@ const DISCOVER_EVERY: Duration = Duration::from_secs(1);
 /// A receiver that has not answered for this long is considered gone.
 const RECEIVER_TTL: Duration = Duration::from_millis(3500);
 
+#[derive(Clone, Copy)]
+struct Receiver {
+    addr: SocketAddr,
+    last_heard: Instant,
+    /// Chosen by the receiver each time it starts; part of every authentication tag.
+    nonce: u64,
+}
+
 pub struct Link {
     sock: UdpSocket,
-    /// Where states go, and when that receiver was last heard from.
-    target: Mutex<Option<(SocketAddr, Instant)>>,
-    /// Bumped whenever a receiver is (re)acquired.
+    auth: Auth,
+    receiver: Mutex<Option<Receiver>>,
+    /// Bumped whenever a receiver is (re)acquired or has restarted.
     epoch: AtomicU32,
+    key_warned: AtomicBool,
 }
 
 impl Link {
@@ -26,31 +35,39 @@ impl Link {
         sock.set_broadcast(true)?;
         prioritise(&sock);
 
-        let link = Arc::new(Link { sock, target: Mutex::new(None), epoch: AtomicU32::new(0) });
+        let link = Arc::new(Link {
+            sock,
+            auth: cfg.auth,
+            receiver: Mutex::new(None),
+            epoch: AtomicU32::new(0),
+            key_warned: AtomicBool::new(false),
+        });
 
-        if let Some(addr) = cfg.target {
-            println!("sending to {addr} (discovery disabled)");
-            *link.target.lock().unwrap() = Some((addr, Instant::now()));
-            return Ok(link);
-        }
-
-        println!("looking for a padlink-receiver on the LAN (UDP {})...", cfg.port);
-        let port = cfg.port;
+        let probe_to = match cfg.target {
+            Some(addr) => {
+                println!("looking for the padlink-receiver at {addr}...");
+                addr
+            }
+            None => {
+                println!("looking for a padlink-receiver on the LAN (UDP {})...", cfg.port);
+                SocketAddr::from((Ipv4Addr::BROADCAST, cfg.port))
+            }
+        };
 
         // Announce ourselves once a second, forever. It doubles as the liveness
         // probe: a receiver that stops answering is dropped and re-discovered,
-        // so the laptop can change IP, reboot or be swapped without any restart here.
+        // so the PC can change IP, reboot or be swapped without any restart here.
         let l = link.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; MAX_PACKET];
-            let probe = Packet::Discover.encode(&mut buf).to_vec();
+            let probe = l.auth.seal(0, &Packet::Discover, &mut buf).to_vec();
             loop {
-                let _ = l.sock.send_to(&probe, (Ipv4Addr::BROADCAST, port));
+                let _ = l.sock.send_to(&probe, probe_to);
                 {
-                    let mut t = l.target.lock().unwrap();
-                    if matches!(*t, Some((_, seen)) if seen.elapsed() > RECEIVER_TTL) {
+                    let mut r = l.receiver.lock().unwrap();
+                    if r.is_some_and(|r| r.last_heard.elapsed() > RECEIVER_TTL) {
                         println!("receiver went quiet, searching again...");
-                        *t = None;
+                        *r = None;
                     }
                 }
                 std::thread::sleep(DISCOVER_EVERY);
@@ -61,38 +78,55 @@ impl Link {
         std::thread::spawn(move || {
             let mut buf = [0u8; MAX_PACKET + 1];
             loop {
-                let Ok((n, from)) = l.sock.recv_from(&mut buf) else {
+                match l.sock.recv_from(&mut buf) {
+                    Ok((n, from)) => l.on_datagram(&buf[..n], from),
                     // e.g. ICMP "port unreachable" surfaced by the OS; not fatal.
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                };
-                match Packet::decode(&buf[..n]) {
-                    Some(Packet::Offer { .. }) => {}
-                    // Echoed straight back so the receiver can time the round trip.
-                    Some(Packet::Ping { t }) => {
-                        if l.target.lock().unwrap().is_some_and(|(addr, _)| addr == from) {
-                            let mut out = [0u8; MAX_PACKET];
-                            let _ = l.sock.send_to(Packet::Pong { t }.encode(&mut out), from);
-                        }
-                        continue;
-                    }
-                    _ => continue,
-                }
-                let mut t = l.target.lock().unwrap();
-                match *t {
-                    Some((addr, ref mut seen)) if addr == from => *seen = Instant::now(),
-                    // Stay with the current receiver while it is alive.
-                    Some(_) => {}
-                    None => {
-                        println!("receiver found at {from}");
-                        *t = Some((from, Instant::now()));
-                        l.epoch.fetch_add(1, Ordering::Relaxed);
-                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
             }
         });
 
         Ok(link)
+    }
+
+    fn on_datagram(&self, d: &[u8], from: SocketAddr) {
+        if is_handshake(d) {
+            let Some(Packet::Offer { nonce }) = self.auth.open(0, d) else {
+                if Packet::decode(d).is_some() && !self.key_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!("a receiver at {} answered, but its --key does not match ours; ignoring it", from.ip());
+                }
+                return;
+            };
+            let mut r = self.receiver.lock().unwrap();
+            match r.as_mut() {
+                Some(cur) if cur.addr == from => {
+                    cur.last_heard = Instant::now();
+                    if cur.nonce != nonce {
+                        // It restarted and has forgotten every controller.
+                        cur.nonce = nonce;
+                        self.epoch.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // Stay with the current receiver while it is alive.
+                Some(_) => {}
+                None => {
+                    println!("receiver found at {from}");
+                    *r = Some(Receiver { addr: from, last_heard: Instant::now(), nonce });
+                    self.epoch.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+
+        let Some(cur) = *self.receiver.lock().unwrap() else { return };
+        if cur.addr != from {
+            return;
+        }
+        match self.auth.open(cur.nonce, d) {
+            // Echoed straight back so the receiver can time the round trip.
+            Some(Packet::Ping { t }) => self.send(Packet::Pong { t }),
+            _ => {}
+        }
     }
 
     /// Changes when a receiver has just been found. Controllers watch this to
@@ -102,10 +136,10 @@ impl Link {
     }
 
     fn send(&self, p: Packet) {
-        let target = self.target.lock().unwrap().map(|(addr, _)| addr);
-        if let Some(addr) = target {
+        let receiver = *self.receiver.lock().unwrap();
+        if let Some(r) = receiver {
             let mut buf = [0u8; MAX_PACKET];
-            let _ = self.sock.send_to(p.encode(&mut buf), addr);
+            let _ = self.sock.send_to(self.auth.seal(r.nonce, &p, &mut buf), r.addr);
         }
     }
 
