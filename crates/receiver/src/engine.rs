@@ -24,6 +24,8 @@ pub struct Config {
     pub kind: Kind,
     pub port: u16,
     pub deadzone: f32,
+    /// How long a disconnected controller keeps its virtual pad and player number.
+    pub hold: Duration,
     pub dry_run: bool,
     pub verbose: bool,
 }
@@ -35,7 +37,11 @@ type Route = (SocketAddr, u8);
 /// One physical controller and the virtual pad that stands in for it.
 struct Seat {
     info: PadInfo,
-    route: Route,
+    /// 1-based, the lowest number that was free when the controller first appeared.
+    player: u8,
+    /// `None` while the controller is away and its place is being held.
+    route: Option<Route>,
+    away_since: Option<Instant>,
     /// `None` when the driver refused to create it (e.g. a fifth Xbox pad).
     device: Option<Box<dyn VirtualPad>>,
     last_seq: u16,
@@ -83,6 +89,7 @@ pub struct Engine {
     seats: HashMap<u64, Seat>,
     routes: HashMap<Route, u64>,
     last_tick: Instant,
+    started: Instant,
     last_stats: Instant,
 }
 
@@ -96,6 +103,7 @@ impl Engine {
             seats: HashMap::new(),
             routes: HashMap::new(),
             last_tick: Instant::now(),
+            started: Instant::now(),
             last_stats: Instant::now(),
         }
     }
@@ -118,7 +126,7 @@ impl Engine {
     }
 
     fn log(&self, msg: String) {
-        println!("{msg}");
+        println!("[{:7.2}] {msg}", self.started.elapsed().as_secs_f32());
     }
 
     fn send(&self, p: Packet, to: SocketAddr) {
@@ -148,21 +156,28 @@ impl Engine {
             }
         }
         if let Some(seat) = self.seats.get_mut(&info.uid) {
-            if seat.route != route {
+            if seat.route != Some(route) {
                 // Same controller, new path (re-plugged, or its sender restarted).
-                let old = std::mem::replace(&mut seat.route, route);
-                if self.routes.get(&old) == Some(&info.uid) {
-                    self.routes.remove(&old);
+                if let Some(old) = seat.route.replace(route) {
+                    if self.routes.get(&old) == Some(&info.uid) {
+                        self.routes.remove(&old);
+                    }
                 }
+            }
+            if seat.away_since.take().is_some() {
+                seat.last_rx = Instant::now() - SEQ_RESET_AFTER;
+                let msg = format!("+ {} is back as player {}", info.name.as_str(), seat.player);
+                self.log(msg);
             }
             return;
         }
 
+        let player = (1..=u8::MAX).find(|n| self.seats.values().all(|s| s.player != *n)).unwrap_or(u8::MAX);
         let kind = self.cfg.kind;
         let device = match self.backend.plug(kind) {
             Ok(d) => {
                 self.log(format!(
-                    "+ {} ({}, from {}) -> virtual {} pad",
+                    "+ {} is player {player} ({}, from {}) -> virtual {} pad",
                     info.name.as_str(),
                     info.bus_label(),
                     route.0.ip(),
@@ -179,7 +194,9 @@ impl Engine {
             info.uid,
             Seat {
                 info,
-                route,
+                player,
+                route: Some(route),
+                away_since: None,
                 device,
                 last_seq: 0,
                 // Far enough back that the first state is accepted whatever its number.
@@ -229,19 +246,44 @@ impl Engine {
         }
     }
 
-    /// Unplugs the controller's virtual pad.
+    /// The controller left. Its virtual pad stays plugged in (idle) for the hold
+    /// time, so that when it comes back - after a battery swap, a Bluetooth
+    /// hiccup, a Pi reboot - it is the same player in the game as before.
     fn disconnect(&mut self, uid: u64, why: &str) {
-        if let Some(seat) = self.seats.remove(&uid) {
-            if self.routes.get(&seat.route) == Some(&uid) {
-                self.routes.remove(&seat.route);
+        let Some(seat) = self.seats.get_mut(&uid) else { return };
+        if let Some(route) = seat.route.take() {
+            if self.routes.get(&route) == Some(&uid) {
+                self.routes.remove(&route);
             }
-            self.log(format!("- {} {why}", seat.info.name.as_str()));
+        }
+        if seat.away_since.is_some() {
+            return;
+        }
+        seat.release();
+        seat.away_since = Some(Instant::now());
+        let (name, player) = (seat.info.name, seat.player);
+        if self.cfg.hold.is_zero() {
+            self.seats.remove(&uid);
+            self.log(format!("- {} {why}", name.as_str()));
+        } else {
+            self.log(format!(
+                "- {} {why} (player {player} is kept free for it for {} s)",
+                name.as_str(),
+                self.cfg.hold.as_secs()
+            ));
         }
     }
 
     fn tick(&mut self) {
         let mut lost = Vec::new();
+        let mut expired = Vec::new();
         for (uid, seat) in self.seats.iter_mut() {
+            if let Some(since) = seat.away_since {
+                if since.elapsed() > self.cfg.hold {
+                    expired.push(*uid);
+                }
+                continue;
+            }
             let idle = seat.last_rx.elapsed();
             if idle > LOST_AFTER {
                 lost.push(*uid);
@@ -253,11 +295,16 @@ impl Engine {
         for uid in lost {
             self.disconnect(uid, "timed out");
         }
+        for uid in expired {
+            if let Some(seat) = self.seats.remove(&uid) {
+                self.log(format!("  {} did not come back, player {} is free again", seat.info.name.as_str(), seat.player));
+            }
+        }
 
         if self.cfg.verbose && self.last_stats.elapsed() >= Duration::from_secs(5) {
             let secs = self.last_stats.elapsed().as_secs_f32();
             self.last_stats = Instant::now();
-            for seat in self.seats.values_mut() {
+            for seat in self.seats.values_mut().filter(|s| s.away_since.is_none()) {
                 println!(
                     "  {}: {:.0} packets/s, {} lost, {} out of order",
                     seat.info.name.as_str(),

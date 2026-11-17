@@ -21,12 +21,14 @@ USAGE: padlink-receiver [OPTIONS]
   --port <N>         UDP port (default 9977)
   --deadzone <0-0.9> stick dead zone as a fraction of travel (default 0:
                      games already apply their own)
+  --hold <seconds>   how long a disconnected controller keeps its virtual pad
+                     and player number, waiting for it to return (default 120)
   --dry-run          do not create virtual controllers, just print what arrives
   -v, --verbose      print per-controller packet statistics every 5 s
   -h, --help         this text";
 
 fn parse_args() -> Result<Config, String> {
-    let mut cfg = Config { kind: Kind::X360, port: DEFAULT_PORT, deadzone: 0.0, dry_run: false, verbose: false };
+    let mut cfg = Config { kind: Kind::X360, port: DEFAULT_PORT, deadzone: 0.0, hold: std::time::Duration::from_secs(120), dry_run: false, verbose: false };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -44,6 +46,9 @@ fn parse_args() -> Result<Config, String> {
                 if !(0.0..=0.9).contains(&cfg.deadzone) {
                     return Err("--deadzone must be between 0 and 0.9".into());
                 }
+            }
+            "--hold" => {
+                cfg.hold = std::time::Duration::from_secs(value("--hold")?.parse().map_err(|_| "invalid --hold")?)
             }
             "--dry-run" => cfg.dry_run = true,
             "-v" | "--verbose" => cfg.verbose = true,
