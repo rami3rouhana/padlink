@@ -88,10 +88,23 @@ struct Sender {
     /// 1-based, in order of appearance; shown when more than one is around.
     number: u8,
     last_heard: Instant,
+    /// Network round trip to this sender in microseconds, smoothed.
+    rtt_us: Option<u32>,
 }
+
+const PING_EVERY: Duration = Duration::from_secs(1);
 
 /// A sender that has been silent this long is forgotten.
 const SENDER_GONE_AFTER: Duration = Duration::from_secs(10);
+
+/// Formats microseconds as milliseconds, e.g. "0.4 ms".
+pub fn ms(us: u32) -> String {
+    if us < 10_000 {
+        format!("{:.1} ms", us as f32 / 1000.0)
+    } else {
+        format!("{} ms", us / 1000)
+    }
+}
 
 pub struct Engine {
     cfg: Config,
@@ -102,6 +115,7 @@ pub struct Engine {
     routes: HashMap<Route, u64>,
     senders: HashMap<SocketAddr, Sender>,
     last_tick: Instant,
+    last_ping: Instant,
     started: Instant,
     last_stats: Instant,
 }
@@ -117,6 +131,7 @@ impl Engine {
             routes: HashMap::new(),
             senders: HashMap::new(),
             last_tick: Instant::now(),
+            last_ping: Instant::now(),
             started: Instant::now(),
             last_stats: Instant::now(),
         }
@@ -153,7 +168,7 @@ impl Engine {
             Some(s) => s.last_heard = Instant::now(),
             None => {
                 let number = (1..=u8::MAX).find(|n| self.senders.values().all(|s| s.number != *n)).unwrap_or(u8::MAX);
-                self.senders.insert(from, Sender { number, last_heard: Instant::now() });
+                self.senders.insert(from, Sender { number, last_heard: Instant::now(), rtt_us: None });
                 self.log(format!("sender {number} found at {}", from.ip()));
             }
         }
@@ -164,6 +179,20 @@ impl Engine {
             Packet::Gone { slot } => {
                 if let Some(uid) = self.routes.remove(&(from, slot)) {
                     self.disconnect(uid, "disconnected");
+                }
+            }
+            Packet::Pong { t } => {
+                let now = self.started.elapsed().as_micros() as u64;
+                // Anything older than a few seconds is a stray, not a measurement.
+                let Some(rtt) = now.checked_sub(t).filter(|d| *d < 5_000_000) else { return };
+                if let Some(s) = self.senders.get_mut(&from) {
+                    let first = s.rtt_us.is_none();
+                    // Light smoothing so the readout does not flicker.
+                    s.rtt_us = Some(s.rtt_us.map_or(rtt as u32, |old| (old * 3 + rtt as u32) / 4));
+                    if first {
+                        let msg = format!("sender {}: network round trip {}", s.number, ms(rtt as u32));
+                        self.log(msg);
+                    }
                 }
             }
             _ => {}
@@ -311,6 +340,13 @@ impl Engine {
     }
 
     fn tick(&mut self) {
+        if self.last_ping.elapsed() >= PING_EVERY {
+            self.last_ping = Instant::now();
+            let t = self.started.elapsed().as_micros() as u64;
+            for addr in self.senders.keys() {
+                self.send(Packet::Ping { t }, *addr);
+            }
+        }
         let mut lost = Vec::new();
         let mut expired = Vec::new();
         for (uid, seat) in self.seats.iter_mut() {
@@ -348,12 +384,14 @@ impl Engine {
             let secs = self.last_stats.elapsed().as_secs_f32();
             self.last_stats = Instant::now();
             for seat in self.seats.values_mut().filter(|s| s.away_since.is_none()) {
+                let rtt = seat.route.and_then(|r| self.senders.get(&r.0)).and_then(|s| s.rtt_us);
                 println!(
-                    "  {}: {:.0} packets/s, {} lost, {} out of order",
+                    "  {}: {:.0} packets/s, {} lost, {} out of order, round trip {}",
                     seat.info.name.as_str(),
                     seat.received as f32 / secs,
                     seat.lost,
-                    seat.stale
+                    seat.stale,
+                    rtt.map_or("?".into(), ms)
                 );
                 (seat.received, seat.lost, seat.stale) = (0, 0, 0);
             }

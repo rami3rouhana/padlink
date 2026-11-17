@@ -66,7 +66,18 @@ impl Link {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 };
-                let Some(Packet::Offer { .. }) = Packet::decode(&buf[..n]) else { continue };
+                match Packet::decode(&buf[..n]) {
+                    Some(Packet::Offer { .. }) => {}
+                    // Echoed straight back so the receiver can time the round trip.
+                    Some(Packet::Ping { t }) => {
+                        if l.target.lock().unwrap().is_some_and(|(addr, _)| addr == from) {
+                            let mut out = [0u8; MAX_PACKET];
+                            let _ = l.sock.send_to(Packet::Pong { t }.encode(&mut out), from);
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                }
                 let mut t = l.target.lock().unwrap();
                 match *t {
                     Some((addr, ref mut seen)) if addr == from => *seen = Instant::now(),
