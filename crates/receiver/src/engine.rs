@@ -406,11 +406,12 @@ impl Engine {
             let low = battery <= LOW_BATTERY;
             // Say it when first known and when it runs low; the table shows the rest.
             if battery != BATTERY_UNKNOWN && (before == BATTERY_UNKNOWN || (low && before > LOW_BATTERY)) {
-                self.status.event(format!(
-                    "  {}: battery {battery}%{}",
-                    seat.info.name.as_str(),
-                    if low { " - charge it soon" } else { "" }
-                ));
+                let name = seat.info.name.as_str();
+                self.status.event(if low {
+                    format!("! {name}: battery {battery}% - charge it soon")
+                } else {
+                    format!("  {name}: battery {battery}%")
+                });
             }
         }
 

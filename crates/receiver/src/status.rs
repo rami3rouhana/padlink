@@ -1,5 +1,6 @@
 //! What the receiver shows: a live table of controllers when it runs in a
-//! terminal, plain log lines otherwise (piped to a file, verbose, dry run).
+//! terminal, plain log lines otherwise (piped to a file, verbose, dry run),
+//! and nothing by itself when the tray icon does the showing.
 
 use crate::engine::ms;
 use std::collections::VecDeque;
@@ -52,8 +53,20 @@ impl Row {
 /// Events kept for the table view.
 const KEPT: usize = 8;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum View {
+    /// One line per event.
+    Log,
+    /// A table redrawn in place; needs a terminal.
+    Table,
+    /// No output; the tray icon reads `snapshot` and `take_notes`.
+    Tray,
+}
+
 struct Inner {
-    table: bool,
+    view: View,
+    /// Events the tray icon has yet to show as a notification.
+    notes: Vec<String>,
     title: String,
     rows: Vec<Row>,
     senders: usize,
@@ -67,15 +80,16 @@ struct Inner {
 pub struct Status(Arc<Mutex<Inner>>);
 
 impl Status {
-    pub fn new(title: String, table: bool) -> Status {
-        if table {
+    pub fn new(title: String, view: View) -> Status {
+        match view {
             // Clear once; after that each redraw overwrites in place, without flicker.
-            print!("\x1b[2J");
-        } else {
-            println!("{title}");
+            View::Table => print!("\x1b[2J"),
+            View::Log => println!("{title}"),
+            View::Tray => {}
         }
         let now = Instant::now();
-        let inner = Inner { table, title, rows: Vec::new(), senders: 0, events: VecDeque::new(), started: now, drawn: now };
+        let (rows, notes, events) = (Vec::new(), Vec::new(), VecDeque::new());
+        let inner = Inner { view, notes, title, rows, senders: 0, events, started: now, drawn: now };
         inner.draw();
         Status(Arc::new(Mutex::new(inner)))
     }
@@ -83,16 +97,39 @@ impl Status {
     /// Something happened that is worth telling: a controller came or went, a warning.
     pub fn event(&self, msg: String) {
         let mut s = self.0.lock().unwrap();
-        if s.table {
-            if s.events.len() == KEPT {
-                s.events.pop_front();
+        match s.view {
+            View::Table => {
+                if s.events.len() == KEPT {
+                    s.events.pop_front();
+                }
+                s.events.push_back((Instant::now(), msg.trim_start().to_string()));
+                s.draw();
             }
-            s.events.push_back((Instant::now(), msg.trim_start().to_string()));
-            s.draw();
-        } else {
-            println!("[{:7.2}] {msg}", s.started.elapsed().as_secs_f32());
-            let _ = std::io::stdout().flush();
+            View::Log => {
+                println!("[{:7.2}] {msg}", s.started.elapsed().as_secs_f32());
+                let _ = std::io::stdout().flush();
+            }
+            // Arrivals (+), departures (-) and warnings (!) are worth a notification;
+            // if nobody collects them, the oldest go.
+            View::Tray => {
+                if msg.starts_with(['+', '-', '!']) {
+                    if s.notes.len() == 4 {
+                        s.notes.remove(0);
+                    }
+                    s.notes.push(msg);
+                }
+            }
         }
+    }
+
+    /// The controllers, ordered by player, and the number of senders.
+    pub fn snapshot(&self) -> (Vec<Row>, usize) {
+        let s = self.0.lock().unwrap();
+        (s.rows.clone(), s.senders)
+    }
+
+    pub fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut self.0.lock().unwrap().notes)
     }
 
     /// The current list of controllers, ordered by player, and the number of senders.
@@ -118,7 +155,7 @@ fn ago(t: Instant) -> String {
 
 impl Inner {
     fn draw(&self) {
-        if !self.table {
+        if self.view != View::Table {
             return;
         }
         // "\x1b[K" clears the rest of each line, so shorter text leaves no residue.
