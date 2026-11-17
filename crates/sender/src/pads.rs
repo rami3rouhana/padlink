@@ -362,6 +362,7 @@ fn stream(mut dev: Device, path: &Path, slot: u8, link: &Link, grab: bool, swap:
     let mut last_send = Instant::now();
     let info = identify(&dev);
     let mut info_sent = Instant::now();
+    let mut epoch = link.epoch();
     link.send_info(slot, info);
     link.send_state(slot, seq, level, sent);
 
@@ -402,7 +403,8 @@ fn stream(mut dev: Device, path: &Path, slot: u8, link: &Link, grab: bool, swap:
             }
         }
 
-        if info_sent.elapsed() >= INFO_EVERY {
+        if info_sent.elapsed() >= INFO_EVERY || epoch != link.epoch() {
+            epoch = link.epoch();
             link.send_info(slot, info);
             info_sent = Instant::now();
         }

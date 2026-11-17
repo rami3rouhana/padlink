@@ -4,6 +4,7 @@ use crate::Config;
 use padlink_proto::{Packet, PadInfo, PadState, MAX_PACKET};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,8 @@ pub struct Link {
     sock: UdpSocket,
     /// Where states go, and when that receiver was last heard from.
     target: Mutex<Option<(SocketAddr, Instant)>>,
+    /// Bumped whenever a receiver is (re)acquired.
+    epoch: AtomicU32,
 }
 
 impl Link {
@@ -23,7 +26,7 @@ impl Link {
         sock.set_broadcast(true)?;
         prioritise(&sock);
 
-        let link = Arc::new(Link { sock, target: Mutex::new(None) });
+        let link = Arc::new(Link { sock, target: Mutex::new(None), epoch: AtomicU32::new(0) });
 
         if let Some(addr) = cfg.target {
             println!("sending to {addr} (discovery disabled)");
@@ -72,12 +75,19 @@ impl Link {
                     None => {
                         println!("receiver found at {from}");
                         *t = Some((from, Instant::now()));
+                        l.epoch.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
         });
 
         Ok(link)
+    }
+
+    /// Changes when a receiver has just been found. Controllers watch this to
+    /// introduce themselves at once instead of at their next periodic repeat.
+    pub fn epoch(&self) -> u32 {
+        self.epoch.load(Ordering::Relaxed)
     }
 
     fn send(&self, p: Packet) {

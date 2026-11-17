@@ -141,8 +141,10 @@ fn test_pattern(link: &net::Link, n: u32) -> ! {
     let start = std::time::Instant::now();
     let mut seq = 0u16;
     let mut info_sent: Option<std::time::Instant> = None;
+    let mut epoch = link.epoch();
     loop {
-        if info_sent.map_or(true, |t| t.elapsed() >= INFO_EVERY) {
+        if info_sent.map_or(true, |t| t.elapsed() >= INFO_EVERY) || epoch != link.epoch() {
+            epoch = link.epoch();
             link.send_info(0, info);
             info_sent = Some(std::time::Instant::now());
         }

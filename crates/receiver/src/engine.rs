@@ -83,6 +83,16 @@ impl Seat {
     }
 }
 
+/// A machine running padlink-sender. Several can feed one receiver.
+struct Sender {
+    /// 1-based, in order of appearance; shown when more than one is around.
+    number: u8,
+    last_heard: Instant,
+}
+
+/// A sender that has been silent this long is forgotten.
+const SENDER_GONE_AFTER: Duration = Duration::from_secs(10);
+
 pub struct Engine {
     cfg: Config,
     backend: Backend,
@@ -90,6 +100,7 @@ pub struct Engine {
     /// Keyed by the controller's `uid`.
     seats: HashMap<u64, Seat>,
     routes: HashMap<Route, u64>,
+    senders: HashMap<SocketAddr, Sender>,
     last_tick: Instant,
     started: Instant,
     last_stats: Instant,
@@ -104,6 +115,7 @@ impl Engine {
             sock,
             seats: HashMap::new(),
             routes: HashMap::new(),
+            senders: HashMap::new(),
             last_tick: Instant::now(),
             started: Instant::now(),
             last_stats: Instant::now(),
@@ -137,6 +149,14 @@ impl Engine {
     }
 
     fn on_packet(&mut self, p: Packet, from: SocketAddr) {
+        match self.senders.get_mut(&from) {
+            Some(s) => s.last_heard = Instant::now(),
+            None => {
+                let number = (1..=u8::MAX).find(|n| self.senders.values().all(|s| s.number != *n)).unwrap_or(u8::MAX);
+                self.senders.insert(from, Sender { number, last_heard: Instant::now() });
+                self.log(format!("sender {number} found at {}", from.ip()));
+            }
+        }
         match p {
             Packet::Discover => self.send(Packet::Offer { nonce: 0 }, from),
             Packet::Info { slot, info } => self.on_info((from, slot), info),
@@ -179,10 +199,10 @@ impl Engine {
         let device = match self.backend.plug(kind) {
             Ok(d) => {
                 self.log(format!(
-                    "+ {} is player {player} ({}, from {}) -> virtual {} pad",
+                    "+ {} is player {player} ({}, on sender {}) -> virtual {} pad",
                     info.name.as_str(),
                     info.bus_label(),
-                    route.0.ip(),
+                    self.senders.get(&route.0).map_or(0, |s| s.number),
                     kind.label()
                 ));
                 Some(d)
@@ -310,6 +330,13 @@ impl Engine {
         }
         for uid in lost {
             self.disconnect(uid, "timed out");
+        }
+        let gone: Vec<SocketAddr> =
+            self.senders.iter().filter(|(_, s)| s.last_heard.elapsed() > SENDER_GONE_AFTER).map(|(a, _)| *a).collect();
+        for addr in gone {
+            if let Some(s) = self.senders.remove(&addr) {
+                self.log(format!("sender {} at {} went away", s.number, addr.ip()));
+            }
         }
         for uid in expired {
             if let Some(seat) = self.seats.remove(&uid) {
