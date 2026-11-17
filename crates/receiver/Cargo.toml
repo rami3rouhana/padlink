@@ -9,3 +9,4 @@ padlink-proto = { path = "../proto" }
 
 [target.'cfg(windows)'.dependencies]
 vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_notification"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }

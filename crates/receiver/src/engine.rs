@@ -5,6 +5,7 @@
 //! same loop iteration, and only the newest state per controller ever matters.
 
 use crate::config::{remap, Remap, Rule};
+use crate::status::{Row, State, Status};
 use crate::vpad::{Backend, Kind, VirtualPad};
 use padlink_proto::{deadzone, is_handshake, seq_newer, Auth, Packet, PadInfo, PadState, BATTERY_UNKNOWN, MAX_PACKET};
 use std::collections::HashMap;
@@ -36,6 +37,9 @@ pub struct Config {
     pub dry_run: bool,
     pub verbose: bool,
 }
+
+/// At or below this percentage a battery is reported as low.
+pub const LOW_BATTERY: u8 = 15;
 
 /// Where a controller's packets come from: the sender's address and the slot
 /// number it uses there. Two Pis can both have a slot 0.
@@ -112,7 +116,7 @@ struct Seat {
 }
 
 impl Seat {
-    fn apply(&mut self) {
+    fn apply(&mut self, status: &Status) {
         let Some(dev) = self.device.as_mut() else { return };
         match dev.update(&self.applied) {
             Ok(()) => (self.dirty, self.failures) = (false, 0),
@@ -122,16 +126,16 @@ impl Seat {
                 self.dirty = true;
                 self.failures += 1;
                 if self.failures == 20 {
-                    eprintln!("{}: driver keeps rejecting updates: {e}", self.info.name.as_str());
+                    status.event(format!("! {}: the driver keeps rejecting updates: {e}", self.info.name.as_str()));
                 }
             }
         }
     }
 
-    fn release(&mut self) {
+    fn release(&mut self, status: &Status) {
         self.neutral = true;
         self.applied = PadState::default();
-        self.apply();
+        self.apply(status);
     }
 }
 
@@ -168,6 +172,7 @@ pub struct Engine {
     cfg: Config,
     backend: Backend,
     sock: UdpSocket,
+    status: Status,
     /// Keyed by the controller's `uid`.
     seats: HashMap<u64, Seat>,
     routes: HashMap<Route, u64>,
@@ -184,12 +189,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(cfg: Config, backend: Backend, sock: UdpSocket) -> Engine {
+    pub fn new(cfg: Config, backend: Backend, sock: UdpSocket, status: Status) -> Engine {
         sock.set_read_timeout(Some(TICK)).expect("set_read_timeout");
         Engine {
             cfg,
             backend,
             sock,
+            status,
             seats: HashMap::new(),
             routes: HashMap::new(),
             senders: HashMap::new(),
@@ -225,7 +231,7 @@ impl Engine {
     }
 
     fn log(&self, msg: String) {
-        println!("[{:7.2}] {msg}", self.started.elapsed().as_secs_f32());
+        self.status.event(msg);
     }
 
     fn send(&self, p: Packet, to: SocketAddr) {
@@ -396,9 +402,15 @@ impl Engine {
         seat.last_rx = Instant::now();
         seat.neutral = false;
         if battery != seat.battery {
-            seat.battery = battery;
-            if battery != BATTERY_UNKNOWN {
-                println!("  {}: battery {battery}%", seat.info.name.as_str());
+            let before = std::mem::replace(&mut seat.battery, battery);
+            let low = battery <= LOW_BATTERY;
+            // Say it when first known and when it runs low; the table shows the rest.
+            if battery != BATTERY_UNKNOWN && (before == BATTERY_UNKNOWN || (low && before > LOW_BATTERY)) {
+                self.status.event(format!(
+                    "  {}: battery {battery}%{}",
+                    seat.info.name.as_str(),
+                    if low { " - charge it soon" } else { "" }
+                ));
             }
         }
 
@@ -410,7 +422,7 @@ impl Engine {
         // Keepalives repeat the same state; skip the driver call for those.
         if pad != seat.applied || seat.dirty {
             seat.applied = pad;
-            seat.apply();
+            seat.apply(&self.status);
         }
     }
 
@@ -428,7 +440,7 @@ impl Engine {
         if seat.away_since.is_some() {
             return;
         }
-        seat.release();
+        seat.release(&self.status);
         seat.away_since = Some(Instant::now());
         let (name, player) = (seat.info.name, seat.player);
         if self.cfg.hold.is_zero() {
@@ -468,8 +480,8 @@ impl Engine {
             if idle > LOST_AFTER {
                 lost.push(*uid);
             } else if idle > NEUTRAL_AFTER && !seat.neutral {
-                seat.release();
-                println!("  {}: link went quiet, inputs released", seat.info.name.as_str());
+                seat.release(&self.status);
+                self.status.event(format!("  {}: link went quiet, inputs released", seat.info.name.as_str()));
             }
         }
         for uid in lost {
@@ -493,16 +505,45 @@ impl Engine {
             self.last_stats = Instant::now();
             for seat in self.seats.values_mut().filter(|s| s.away_since.is_none()) {
                 let rtt = seat.route.and_then(|r| self.senders.get(&r.0)).and_then(|s| s.rtt_us);
-                println!(
+                self.status.event(format!(
                     "  {}: {:.0} packets/s, {} lost, {} out of order, round trip {}",
                     seat.info.name.as_str(),
                     seat.received as f32 / secs,
                     seat.lost,
                     seat.stale,
                     rtt.map_or("?".into(), ms)
-                );
+                ));
                 (seat.received, seat.lost, seat.stale) = (0, 0, 0);
             }
         }
+        self.publish();
+    }
+
+    /// Hands the current picture to whatever displays it.
+    fn publish(&self) {
+        let mut rows: Vec<Row> = self
+            .seats
+            .values()
+            .map(|seat| {
+                let sender = seat.route.and_then(|r| self.senders.get(&r.0));
+                Row {
+                    player: seat.player,
+                    name: seat.info.name.as_str().to_string(),
+                    bus: seat.info.bus_label(),
+                    pad: seat.kind.label(),
+                    sender: sender.map_or(0, |s| s.number),
+                    battery: Some(seat.battery).filter(|b| *b != BATTERY_UNKNOWN),
+                    rtt_us: sender.and_then(|s| s.rtt_us),
+                    state: match seat.away_since {
+                        Some(since) => State::Away { left_s: self.cfg.hold.saturating_sub(since.elapsed()).as_secs() },
+                        None if seat.device.is_none() => State::NoPad,
+                        None if seat.last_rx.elapsed() > NEUTRAL_AFTER => State::Quiet,
+                        None => State::Connected,
+                    },
+                }
+            })
+            .collect();
+        rows.sort_by_key(|r| r.player);
+        self.status.publish(rows, self.senders.len());
     }
 }
