@@ -23,6 +23,10 @@ pub trait VirtualPad {
     fn update(&mut self, pad: &PadState) -> Result<(), String>;
 }
 
+/// Called from a driver thread when a game changes the vibration of a virtual
+/// pad, with the strong and weak motor levels.
+pub type RumbleFn = Box<dyn FnMut(u8, u8) + Send>;
+
 pub enum Backend {
     DryRun,
     #[cfg(windows)]
@@ -48,11 +52,14 @@ impl Backend {
         Err("virtual controllers need Windows with ViGEmBus; on this OS use --dry-run".into())
     }
 
-    pub fn plug(&self, kind: Kind) -> Result<Box<dyn VirtualPad>, String> {
+    pub fn plug(&self, kind: Kind, rumble: RumbleFn) -> Result<Box<dyn VirtualPad>, String> {
         match self {
-            Backend::DryRun => Ok(Box::new(Printer)),
+            Backend::DryRun => {
+                drop(rumble);
+                Ok(Box::new(Printer))
+            }
             #[cfg(windows)]
-            Backend::Vigem(client) => windows::plug(client.clone(), kind),
+            Backend::Vigem(client) => windows::plug(client.clone(), kind, rumble),
         }
     }
 }
@@ -71,7 +78,7 @@ impl VirtualPad for Printer {
 
 #[cfg(windows)]
 mod windows {
-    use super::{Kind, VirtualPad};
+    use super::{Kind, RumbleFn, VirtualPad};
     use padlink_proto::PadState;
     use std::sync::Arc;
     use vigem_client as vg;
@@ -79,19 +86,25 @@ mod windows {
     struct X360(vg::Xbox360Wired<Arc<vg::Client>>);
     struct Ds4(vg::DualShock4Wired<Arc<vg::Client>>);
 
-    pub fn plug(client: Arc<vg::Client>, kind: Kind) -> Result<Box<dyn VirtualPad>, String> {
+    pub fn plug(client: Arc<vg::Client>, kind: Kind, mut rumble: RumbleFn) -> Result<Box<dyn VirtualPad>, String> {
         let err = |e: vg::Error| format!("{e:?}");
         match kind {
             Kind::X360 => {
                 let mut t = vg::Xbox360Wired::new(client, vg::TargetId::XBOX360_WIRED);
                 t.plugin().map_err(err)?;
                 t.wait_ready().map_err(err)?;
+                // The thread ends by itself when the pad is unplugged.
+                if let Ok(notifications) = t.request_notification() {
+                    notifications.spawn_thread(move |_, n| rumble(n.large_motor, n.small_motor));
+                }
                 Ok(Box::new(X360(t)))
             }
             Kind::Ds4 => {
                 let mut t = vg::DualShock4Wired::new(client, vg::TargetId::DUALSHOCK4_WIRED);
                 t.plugin().map_err(err)?;
                 t.wait_ready().map_err(err)?;
+                // The driver library does not report DS4 vibration yet.
+                drop(rumble);
                 Ok(Box::new(Ds4(t)))
             }
         }

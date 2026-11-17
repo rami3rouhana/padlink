@@ -8,4 +8,4 @@ edition.workspace = true
 padlink-proto = { path = "../proto" }
 
 [target.'cfg(windows)'.dependencies]
-vigem-client = { version = "0.1", features = ["unstable_ds4"] }
+vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_notification"] }

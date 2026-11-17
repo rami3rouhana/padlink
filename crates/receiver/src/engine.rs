@@ -9,6 +9,7 @@ use crate::vpad::{Backend, Kind, VirtualPad};
 use padlink_proto::{deadzone, is_handshake, seq_newer, Auth, Packet, PadInfo, PadState, BATTERY_UNKNOWN, MAX_PACKET};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Silence after which a pad's inputs are released, so a dropped link can never
@@ -40,6 +41,49 @@ pub struct Config {
 /// number it uses there. Two Pis can both have a slot 0.
 type Route = (SocketAddr, u8);
 
+/// Vibration on its way back to a physical controller. Shared with the driver
+/// thread that reports what the game asked for, which sends it on immediately.
+struct Rumble {
+    sock: UdpSocket,
+    auth: Auth,
+    nonce: u64,
+    /// Where the controller currently is, and the last requested motor levels.
+    state: Mutex<(Option<Route>, u8, u8)>,
+}
+
+impl Rumble {
+    fn set(&self, strong: u8, weak: u8) {
+        let mut s = self.state.lock().unwrap();
+        // The driver also notifies about the player LED; only motor changes matter.
+        if (s.1, s.2) == (strong, weak) {
+            return;
+        }
+        (s.1, s.2) = (strong, weak);
+        self.send(*s);
+    }
+
+    fn set_route(&self, route: Option<Route>) {
+        self.state.lock().unwrap().0 = route;
+    }
+
+    /// The sender stops the motors on its own unless told again within a second.
+    fn repeat(&self) {
+        let s = *self.state.lock().unwrap();
+        if (s.1, s.2) != (0, 0) {
+            self.send(s);
+        }
+    }
+
+    fn send(&self, (route, strong, weak): (Option<Route>, u8, u8)) {
+        if let Some((addr, slot)) = route {
+            let mut buf = [0u8; MAX_PACKET];
+            let _ = self.sock.send_to(self.auth.seal(self.nonce, &Packet::Rumble { slot, strong, weak }, &mut buf), addr);
+        }
+    }
+}
+
+const RUMBLE_EVERY: Duration = Duration::from_millis(400);
+
 /// One physical controller and the virtual pad that stands in for it.
 struct Seat {
     info: PadInfo,
@@ -51,6 +95,7 @@ struct Seat {
     kind: Kind,
     deadzone: f32,
     remap: Option<Remap>,
+    rumble: Arc<Rumble>,
     /// `None` when the driver refused to create it (e.g. a fifth Xbox pad).
     device: Option<Box<dyn VirtualPad>>,
     last_seq: u16,
@@ -133,6 +178,7 @@ pub struct Engine {
     rejected: Vec<std::net::IpAddr>,
     last_tick: Instant,
     last_ping: Instant,
+    last_rumble: Instant,
     started: Instant,
     last_stats: Instant,
 }
@@ -151,6 +197,7 @@ impl Engine {
             rejected: Vec::new(),
             last_tick: Instant::now(),
             last_ping: Instant::now(),
+            last_rumble: Instant::now(),
             started: Instant::now(),
             last_stats: Instant::now(),
         }
@@ -247,6 +294,7 @@ impl Engine {
         if let Some(seat) = self.seats.get_mut(&info.uid) {
             if seat.route != Some(route) {
                 // Same controller, new path (re-plugged, or its sender restarted).
+                seat.rumble.set_route(Some(route));
                 if let Some(old) = seat.route.replace(route) {
                     if self.routes.get(&old) == Some(&info.uid) {
                         self.routes.remove(&old);
@@ -266,7 +314,15 @@ impl Engine {
         let deadzone = rule.and_then(|r| r.deadzone).unwrap_or(self.cfg.deadzone);
         let remap = rule.and_then(|r| r.remap);
         let kind = rule.and_then(|r| r.pad).unwrap_or(self.cfg.pad).unwrap_or_else(|| self.pick_kind(&info));
-        let device = match self.backend.plug(kind) {
+        let rumble = Arc::new(Rumble {
+            sock: self.sock.try_clone().expect("duplicate socket handle"),
+            auth: self.cfg.auth,
+            nonce: self.nonce,
+            state: Mutex::new((Some(route), 0, 0)),
+        });
+        let from_game = rumble.clone();
+        let on_rumble = Box::new(move |strong, weak| from_game.set(strong, weak));
+        let device = match self.backend.plug(kind, on_rumble) {
             Ok(d) => {
                 self.log(format!(
                     "+ {} is player {player} ({}, on sender {}) -> virtual {} pad",
@@ -292,6 +348,7 @@ impl Engine {
                 kind,
                 deadzone,
                 remap,
+                rumble,
                 device,
                 last_seq: 0,
                 // Far enough back that the first state is accepted whatever its number.
@@ -362,6 +419,7 @@ impl Engine {
     /// hiccup, a Pi reboot - it is the same player in the game as before.
     fn disconnect(&mut self, uid: u64, why: &str) {
         let Some(seat) = self.seats.get_mut(&uid) else { return };
+        seat.rumble.set_route(None);
         if let Some(route) = seat.route.take() {
             if self.routes.get(&route) == Some(&uid) {
                 self.routes.remove(&route);
@@ -386,6 +444,10 @@ impl Engine {
     }
 
     fn tick(&mut self) {
+        if self.last_rumble.elapsed() >= RUMBLE_EVERY {
+            self.last_rumble = Instant::now();
+            self.seats.values().for_each(|s| s.rumble.repeat());
+        }
         if self.last_ping.elapsed() >= PING_EVERY {
             self.last_ping = Instant::now();
             let t = self.started.elapsed().as_micros() as u64;

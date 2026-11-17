@@ -2,6 +2,7 @@
 
 use crate::Config;
 use padlink_proto::{is_handshake, Auth, Packet, PadInfo, PadState, MAX_PACKET};
+use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,7 +28,12 @@ pub struct Link {
     /// Bumped whenever a receiver is (re)acquired or has restarted.
     epoch: AtomicU32,
     key_warned: AtomicBool,
+    /// Per slot, what to call when the receiver asks for vibration.
+    rumble: Mutex<HashMap<u8, RumbleFn>>,
 }
+
+/// Called with the strong and weak motor levels (0 = off).
+pub type RumbleFn = Box<dyn FnMut(u8, u8) + Send>;
 
 impl Link {
     pub fn start(cfg: &Config) -> io::Result<Arc<Link>> {
@@ -41,6 +47,7 @@ impl Link {
             receiver: Mutex::new(None),
             epoch: AtomicU32::new(0),
             key_warned: AtomicBool::new(false),
+            rumble: Mutex::new(HashMap::new()),
         });
 
         let probe_to = match cfg.target {
@@ -125,8 +132,22 @@ impl Link {
         match self.auth.open(cur.nonce, d) {
             // Echoed straight back so the receiver can time the round trip.
             Some(Packet::Ping { t }) => self.send(Packet::Pong { t }),
+            Some(Packet::Rumble { slot, strong, weak }) => {
+                if let Some(f) = self.rumble.lock().unwrap().get_mut(&slot) {
+                    f(strong, weak);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Routes the receiver's vibration requests for `slot` to `f`; `None` stops that.
+    pub fn on_rumble(&self, slot: u8, f: Option<RumbleFn>) {
+        let mut map = self.rumble.lock().unwrap();
+        match f {
+            Some(f) => map.insert(slot, f),
+            None => map.remove(&slot),
+        };
     }
 
     /// Changes when a receiver has just been found. Controllers watch this to

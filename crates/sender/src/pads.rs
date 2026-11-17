@@ -6,7 +6,7 @@
 
 use crate::net::Link;
 use crate::{Config, INFO_EVERY, KEEPALIVE};
-use evdev::{AbsoluteAxisType, Device, EventType, Key};
+use evdev::{AbsoluteAxisType, Device, EventType, FFEffect, FFEffectData, FFEffectKind, FFEffectType, FFReplay, Key};
 use padlink_proto::{
     btn, fnv1a64, scale_stick, scale_trigger, Name, PadInfo, PadState, BATTERY_UNKNOWN, BUS_BLUETOOTH, BUS_UNKNOWN,
     BUS_USB, MAX_SLOTS,
@@ -120,6 +120,7 @@ fn scan(cfg: &Config, link: &Arc<Link>, reg: &Arc<Mutex<Registry>>) {
             println!("[slot {slot}] + {name} ({})", path.display());
             let why = stream(dev, &path, slot as u8, &link, grab, swap);
             println!("[slot {slot}] - {name} ({why})");
+            link.on_rumble(slot as u8, None);
             link.send_gone(slot as u8);
             let mut r = reg.lock().unwrap();
             r.slots[slot] = false;
@@ -314,6 +315,47 @@ fn battery(uniq: &str) -> u8 {
     BATTERY_UNKNOWN
 }
 
+/// Vibration for one controller. The effect lasts a second at most and the
+/// receiver repeats its request while a game keeps the motors on, so they
+/// can never be left running by a lost packet or a receiver that vanished.
+struct Rumbler {
+    effect: FFEffect,
+    level: (u8, u8),
+}
+
+impl Rumbler {
+    fn data(strong: u8, weak: u8) -> FFEffectData {
+        FFEffectData {
+            direction: 0,
+            trigger: Default::default(),
+            replay: FFReplay { length: 1000, delay: 0 },
+            kind: FFEffectKind::Rumble { strong_magnitude: strong as u16 * 257, weak_magnitude: weak as u16 * 257 },
+        }
+    }
+
+    /// `None` when the controller has no rumble motors (or no write access).
+    fn new(dev: &mut Device) -> Option<Rumbler> {
+        if !dev.supported_ff().is_some_and(|ff| ff.contains(FFEffectType::FF_RUMBLE)) {
+            return None;
+        }
+        let effect = dev.upload_ff_effect(Self::data(0, 0)).ok()?;
+        Some(Rumbler { effect, level: (0, 0) })
+    }
+
+    fn set(&mut self, strong: u8, weak: u8) {
+        if (strong, weak) == (0, 0) {
+            let _ = self.effect.stop();
+        } else {
+            if (strong, weak) != self.level {
+                let _ = self.effect.update(Self::data(strong, weak));
+            }
+            // Also restarts the one-second clock when the level is unchanged.
+            let _ = self.effect.play(1);
+        }
+        self.level = (strong, weak);
+    }
+}
+
 /// Name and identity as shown on the receiver. The `uid` must survive a
 /// reconnect, so that the same controller gets the same virtual pad back:
 /// wireless pads are identified by their MAC address, wired ones by model plus
@@ -351,6 +393,10 @@ fn stream(mut dev: Device, path: &Path, slot: u8, link: &Link, grab: bool, swap:
         if let Err(e) = dev.grab() {
             eprintln!("[slot {slot}] --grab failed: {e}");
         }
+    }
+    match Rumbler::new(&mut dev) {
+        Some(mut r) => link.on_rumble(slot, Some(Box::new(move |strong, weak| r.set(strong, weak)))),
+        None => link.on_rumble(slot, None),
     }
     let uniq = dev.unique_name().unwrap_or("").to_string();
     let mut level = battery(&uniq);

@@ -143,6 +143,7 @@ fn test_pattern(link: &net::Link, n: u32) -> ! {
         (format!("Test pattern {n}"), 0, 0)
     };
     let info = PadInfo { bus: BUS_UNKNOWN, vendor, product, uid: fnv1a64(name.as_bytes()), name: Name::new(&name) };
+    link.on_rumble(0, Some(Box::new(|strong, weak| println!("rumble: strong {strong}, weak {weak}"))));
     let start = std::time::Instant::now();
     let mut seq = 0u16;
     let mut info_sent: Option<std::time::Instant> = None;
