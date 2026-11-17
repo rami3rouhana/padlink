@@ -1,0 +1,8 @@
+/target
+/dist
+
+# Unrelated personal files that live in this folder but are not part of the project
+/Ramy/
+/produc
+/soul.py
+/output.py

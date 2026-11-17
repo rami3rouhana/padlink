@@ -1,0 +1,7 @@
+[package]
+name = "padlink-proto"
+description = "Wire format shared by the padlink sender and receiver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

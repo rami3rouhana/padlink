@@ -1,0 +1,7 @@
+# Cross-link the static Raspberry Pi binaries with the LLD that ships with Rust,
+# so no external cross toolchain is needed (works from Windows, Linux and CI).
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
