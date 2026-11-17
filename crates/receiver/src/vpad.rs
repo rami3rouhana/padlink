@@ -3,7 +3,7 @@
 
 use padlink_proto::PadState;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     X360,
     Ds4,

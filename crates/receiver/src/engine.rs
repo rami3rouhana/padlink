@@ -4,6 +4,7 @@
 //! Single thread, no queue: a packet is decoded and handed to the driver in the
 //! same loop iteration, and only the newest state per controller ever matters.
 
+use crate::config::{remap, Remap, Rule};
 use crate::vpad::{Backend, Kind, VirtualPad};
 use padlink_proto::{deadzone, is_handshake, seq_newer, Auth, Packet, PadInfo, PadState, BATTERY_UNKNOWN, MAX_PACKET};
 use std::collections::HashMap;
@@ -29,6 +30,8 @@ pub struct Config {
     pub hold: Duration,
     /// Shared key; packets without a valid tag are ignored when set.
     pub auth: Auth,
+    /// Per-controller overrides from the settings file; the first match applies.
+    pub rules: Vec<Rule>,
     pub dry_run: bool,
     pub verbose: bool,
 }
@@ -46,6 +49,8 @@ struct Seat {
     route: Option<Route>,
     away_since: Option<Instant>,
     kind: Kind,
+    deadzone: f32,
+    remap: Option<Remap>,
     /// `None` when the driver refused to create it (e.g. a fifth Xbox pad).
     device: Option<Box<dyn VirtualPad>>,
     last_seq: u16,
@@ -257,7 +262,10 @@ impl Engine {
         }
 
         let player = (1..=u8::MAX).find(|n| self.seats.values().all(|s| s.player != *n)).unwrap_or(u8::MAX);
-        let kind = self.cfg.pad.unwrap_or_else(|| self.pick_kind(&info));
+        let rule = self.cfg.rules.iter().find(|r| r.matches(&info));
+        let deadzone = rule.and_then(|r| r.deadzone).unwrap_or(self.cfg.deadzone);
+        let remap = rule.and_then(|r| r.remap);
+        let kind = rule.and_then(|r| r.pad).unwrap_or(self.cfg.pad).unwrap_or_else(|| self.pick_kind(&info));
         let device = match self.backend.plug(kind) {
             Ok(d) => {
                 self.log(format!(
@@ -282,6 +290,8 @@ impl Engine {
                 route: Some(route),
                 away_since: None,
                 kind,
+                deadzone,
+                remap,
                 device,
                 last_seq: 0,
                 // Far enough back that the first state is accepted whatever its number.
@@ -335,8 +345,11 @@ impl Engine {
             }
         }
 
-        (pad.lx, pad.ly) = deadzone(pad.lx, pad.ly, self.cfg.deadzone);
-        (pad.rx, pad.ry) = deadzone(pad.rx, pad.ry, self.cfg.deadzone);
+        (pad.lx, pad.ly) = deadzone(pad.lx, pad.ly, seat.deadzone);
+        (pad.rx, pad.ry) = deadzone(pad.rx, pad.ry, seat.deadzone);
+        if let Some(table) = &seat.remap {
+            pad.buttons = remap(pad.buttons, table);
+        }
         // Keepalives repeat the same state; skip the driver call for those.
         if pad != seat.applied || seat.dirty {
             seat.applied = pad;
