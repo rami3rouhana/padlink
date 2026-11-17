@@ -1,0 +1,143 @@
+//! padlink-sender: runs on the machine the controllers are connected to
+//! (the Raspberry Pi running Batocera) and streams their state to the receiver.
+//!
+//! No address needs configuring: the sender broadcasts a discovery packet on the
+//! LAN, the receiver answers, and from then on states go straight to it.
+
+mod net;
+#[cfg(target_os = "linux")]
+mod pads;
+
+use std::time::Duration;
+
+/// How often an unchanged state is repeated. This heals lost packets and tells
+/// the receiver the controller is still alive.
+pub const KEEPALIVE: Duration = Duration::from_millis(100);
+
+pub struct Config {
+    pub port: u16,
+    pub target: Option<std::net::SocketAddr>,
+    pub grab: bool,
+    pub swap_xy: Option<bool>,
+    pub test_pattern: bool,
+    pub verbose: bool,
+}
+
+const HELP: &str = "\
+padlink-sender - stream game controllers to a padlink-receiver on the LAN
+
+USAGE: padlink-sender [OPTIONS]
+
+  --port <N>         UDP port (default 9977)
+  --target <IP>      skip auto-discovery and send to this address
+  --grab             take exclusive control of the controllers, so Batocera
+                     itself does not react to them while they are streamed
+  --swap-xy <on|off> force the X/Y (square/triangle) swap instead of auto-detecting
+  --test-pattern     stream a synthetic controller that circles its left stick
+                     and taps A (works on any OS, no controller needed)
+  -v, --verbose      log every device that is looked at
+  -h, --help         this text";
+
+fn parse_args() -> Result<Config, String> {
+    let mut cfg = Config {
+        port: padlink_proto::DEFAULT_PORT,
+        target: None,
+        grab: false,
+        swap_xy: None,
+        test_pattern: false,
+        verbose: false,
+    };
+    let mut target_host: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
+        match a.as_str() {
+            "--port" => cfg.port = value("--port")?.parse().map_err(|_| "invalid --port")?,
+            "--target" => target_host = Some(value("--target")?),
+            "--grab" => cfg.grab = true,
+            "--swap-xy" => {
+                cfg.swap_xy = Some(match value("--swap-xy")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--swap-xy takes on or off".into()),
+                })
+            }
+            "--test-pattern" => cfg.test_pattern = true,
+            "-v" | "--verbose" => cfg.verbose = true,
+            "-h" | "--help" => {
+                println!("{HELP}");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown option {other} (try --help)")),
+        }
+    }
+    if let Some(host) = target_host {
+        use std::net::ToSocketAddrs;
+        let with_port = if host.parse::<std::net::IpAddr>().is_ok() || !host.contains(':') {
+            format!("{host}:{}", cfg.port)
+        } else {
+            host
+        };
+        cfg.target = Some(
+            with_port
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+                .ok_or(format!("cannot resolve --target {with_port}"))?,
+        );
+    }
+    Ok(cfg)
+}
+
+fn main() {
+    let cfg = match parse_args() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let link = match net::Link::start(&cfg) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: cannot open UDP socket: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if cfg.test_pattern {
+        println!("streaming a synthetic controller (Ctrl+C to stop)");
+        test_pattern(&link);
+    }
+
+    #[cfg(target_os = "linux")]
+    pads::run(&cfg, link);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = link;
+        eprintln!("error: reading real controllers needs Linux; on this OS only --test-pattern works");
+        std::process::exit(1);
+    }
+}
+
+/// Left stick draws a circle once per second, A is held for the first 200 ms of
+/// every second. Handy for checking the whole chain without a controller.
+fn test_pattern(link: &net::Link) -> ! {
+    use padlink_proto::{btn, PadState, BATTERY_UNKNOWN};
+    let start = std::time::Instant::now();
+    let mut seq = 0u16;
+    loop {
+        let t = start.elapsed().as_secs_f32();
+        let angle = t * std::f32::consts::TAU;
+        let pad = PadState {
+            buttons: if t.fract() < 0.2 { btn::A } else { 0 },
+            lx: (angle.cos() * 32767.0) as i16,
+            ly: (angle.sin() * 32767.0) as i16,
+            ..Default::default()
+        };
+        seq = seq.wrapping_add(1);
+        link.send_state(0, seq, BATTERY_UNKNOWN, pad);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}

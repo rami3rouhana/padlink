@@ -1,0 +1,12 @@
+[package]
+name = "padlink-sender"
+description = "Reads controllers on the Raspberry Pi (Batocera) and streams them over UDP"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+padlink-proto = { path = "../proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
+libc = "0.2"
