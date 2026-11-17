@@ -1,0 +1,11 @@
+[package]
+name = "padlink-receiver"
+description = "Turns padlink packets into virtual Xbox 360 / DualShock 4 controllers on Windows"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+padlink-proto = { path = "../proto" }
+
+[target.'cfg(windows)'.dependencies]
+vigem-client = { version = "0.1", features = ["unstable_ds4"] }
