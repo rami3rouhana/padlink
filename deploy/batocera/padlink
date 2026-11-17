@@ -1,0 +1,25 @@
+#!/bin/bash
+# Batocera service for padlink-sender.
+#
+# Install (over SSH, as root):
+#   mkdir -p /userdata/system/padlink /userdata/system/services
+#   cp padlink-sender /userdata/system/padlink/ && chmod +x /userdata/system/padlink/padlink-sender
+#   cp padlink /userdata/system/services/padlink && chmod +x /userdata/system/services/padlink
+#   batocera-services enable padlink && batocera-services start padlink
+#
+# Add --grab to OPTIONS if Batocera's own menus should ignore the controllers
+# while they are being streamed.
+
+BIN=/userdata/system/padlink/padlink-sender
+LOG=/userdata/system/logs/padlink.log
+OPTIONS=""
+
+case "$1" in
+    start)
+        # Realtime priority keeps input forwarding ahead of whatever else the Pi is doing.
+        chrt -f 50 "$BIN" $OPTIONS >"$LOG" 2>&1 &
+        ;;
+    stop)
+        killall padlink-sender 2>/dev/null
+        ;;
+esac
