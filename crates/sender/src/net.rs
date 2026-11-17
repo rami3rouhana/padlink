@@ -1,7 +1,7 @@
 //! UDP link to the receiver, including zero-config discovery.
 
 use crate::Config;
-use padlink_proto::{Packet, PadState, MAX_PACKET};
+use padlink_proto::{Packet, PadInfo, PadState, MAX_PACKET};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -56,16 +56,14 @@ impl Link {
 
         let l = link.clone();
         std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; MAX_PACKET + 1];
             loop {
                 let Ok((n, from)) = l.sock.recv_from(&mut buf) else {
                     // e.g. ICMP "port unreachable" surfaced by the OS; not fatal.
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 };
-                if Packet::decode(&buf[..n]) != Some(Packet::Offer) {
-                    continue;
-                }
+                let Some(Packet::Offer { .. }) = Packet::decode(&buf[..n]) else { continue };
                 let mut t = l.target.lock().unwrap();
                 match *t {
                     Some((addr, ref mut seen)) if addr == from => *seen = Instant::now(),
@@ -92,6 +90,12 @@ impl Link {
 
     pub fn send_state(&self, slot: u8, seq: u16, battery: u8, pad: PadState) {
         self.send(Packet::State { slot, seq, battery, pad });
+    }
+
+    /// Tells the receiver who the controller in `slot` is. Repeated every second,
+    /// so a receiver that starts later (or restarts) learns it too.
+    pub fn send_info(&self, slot: u8, info: PadInfo) {
+        self.send(Packet::Info { slot, info });
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

@@ -5,9 +5,12 @@
 //! on a timer and nothing is queued.
 
 use crate::net::Link;
-use crate::{Config, KEEPALIVE};
+use crate::{Config, INFO_EVERY, KEEPALIVE};
 use evdev::{AbsoluteAxisType, Device, EventType, Key};
-use padlink_proto::{btn, scale_stick, scale_trigger, PadState, BATTERY_UNKNOWN, MAX_SLOTS};
+use padlink_proto::{
+    btn, fnv1a64, scale_stick, scale_trigger, Name, PadInfo, PadState, BATTERY_UNKNOWN, BUS_BLUETOOTH, BUS_UNKNOWN,
+    BUS_USB, MAX_SLOTS,
+};
 use std::collections::HashSet;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -311,6 +314,33 @@ fn battery(uniq: &str) -> u8 {
     BATTERY_UNKNOWN
 }
 
+/// Name and identity as shown on the receiver. The `uid` must survive a
+/// reconnect, so that the same controller gets the same virtual pad back:
+/// wireless pads are identified by their MAC address, wired ones by model plus
+/// the USB port they sit in (plus this machine, in case two Pis are in use).
+fn identify(dev: &Device) -> PadInfo {
+    let id = dev.input_id();
+    let uniq = dev.unique_name().unwrap_or("").to_ascii_lowercase();
+    let uid = if uniq.chars().any(|c| c.is_ascii_hexdigit() && c != '0') {
+        fnv1a64(uniq.as_bytes())
+    } else {
+        let machine = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+        let port = dev.physical_path().unwrap_or("");
+        fnv1a64(format!("{}|{:04x}:{:04x}|{port}", machine.trim(), id.vendor(), id.product()).as_bytes())
+    };
+    PadInfo {
+        bus: match id.bus_type().0 {
+            0x03 => BUS_USB,
+            0x05 => BUS_BLUETOOTH,
+            _ => BUS_UNKNOWN,
+        },
+        vendor: id.vendor(),
+        product: id.product(),
+        uid,
+        name: Name::new(dev.name().unwrap_or("controller").trim()),
+    }
+}
+
 /// Streams one controller until it disappears. Returns the reason it stopped.
 fn stream(mut dev: Device, path: &Path, slot: u8, link: &Link, grab: bool, swap: Option<bool>) -> String {
     let mut reader = match Reader::new(&dev, path, swap) {
@@ -330,6 +360,9 @@ fn stream(mut dev: Device, path: &Path, slot: u8, link: &Link, grab: bool, swap:
     let mut seq = 0u16;
     let mut sent = reader.pad;
     let mut last_send = Instant::now();
+    let info = identify(&dev);
+    let mut info_sent = Instant::now();
+    link.send_info(slot, info);
     link.send_state(slot, seq, level, sent);
 
     loop {
@@ -369,6 +402,10 @@ fn stream(mut dev: Device, path: &Path, slot: u8, link: &Link, grab: bool, swap:
             }
         }
 
+        if info_sent.elapsed() >= INFO_EVERY {
+            link.send_info(slot, info);
+            info_sent = Instant::now();
+        }
         if last_send.elapsed() >= KEEPALIVE {
             if level_read.elapsed() >= BATTERY_EVERY {
                 level = battery(&uniq);

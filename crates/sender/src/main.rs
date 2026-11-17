@@ -13,13 +13,15 @@ use std::time::Duration;
 /// How often an unchanged state is repeated. This heals lost packets and tells
 /// the receiver the controller is still alive.
 pub const KEEPALIVE: Duration = Duration::from_millis(100);
+/// How often a controller's name and identity are repeated.
+pub const INFO_EVERY: Duration = Duration::from_secs(1);
 
 pub struct Config {
     pub port: u16,
     pub target: Option<std::net::SocketAddr>,
     pub grab: bool,
     pub swap_xy: Option<bool>,
-    pub test_pattern: bool,
+    pub test_pattern: Option<u32>,
     pub verbose: bool,
 }
 
@@ -33,8 +35,9 @@ USAGE: padlink-sender [OPTIONS]
   --grab             take exclusive control of the controllers, so Batocera
                      itself does not react to them while they are streamed
   --swap-xy <on|off> force the X/Y (square/triangle) swap instead of auto-detecting
-  --test-pattern     stream a synthetic controller that circles its left stick
-                     and taps A (works on any OS, no controller needed)
+  --test-pattern[=N] stream a synthetic controller that circles its left stick
+                     and taps A (works on any OS, no controller needed).
+                     Give each extra instance its own number N
   -v, --verbose      log every device that is looked at
   -h, --help         this text";
 
@@ -44,7 +47,7 @@ fn parse_args() -> Result<Config, String> {
         target: None,
         grab: false,
         swap_xy: None,
-        test_pattern: false,
+        test_pattern: None,
         verbose: false,
     };
     let mut target_host: Option<String> = None;
@@ -62,7 +65,10 @@ fn parse_args() -> Result<Config, String> {
                     _ => return Err("--swap-xy takes on or off".into()),
                 })
             }
-            "--test-pattern" => cfg.test_pattern = true,
+            "--test-pattern" => cfg.test_pattern = Some(1),
+            t if t.starts_with("--test-pattern=") => {
+                cfg.test_pattern = Some(t[15..].parse().map_err(|_| "--test-pattern=N needs a number")?)
+            }
             "-v" | "--verbose" => cfg.verbose = true,
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -105,9 +111,9 @@ fn main() {
         }
     };
 
-    if cfg.test_pattern {
-        println!("streaming a synthetic controller (Ctrl+C to stop)");
-        test_pattern(&link);
+    if let Some(n) = cfg.test_pattern {
+        println!("streaming synthetic controller {n} (Ctrl+C to stop)");
+        test_pattern(&link, n);
     }
 
     #[cfg(target_os = "linux")]
@@ -123,11 +129,18 @@ fn main() {
 
 /// Left stick draws a circle once per second, A is held for the first 200 ms of
 /// every second. Handy for checking the whole chain without a controller.
-fn test_pattern(link: &net::Link) -> ! {
-    use padlink_proto::{btn, PadState, BATTERY_UNKNOWN};
+fn test_pattern(link: &net::Link, n: u32) -> ! {
+    use padlink_proto::{btn, fnv1a64, Name, PadInfo, PadState, BATTERY_UNKNOWN, BUS_UNKNOWN};
+    let name = format!("Test pattern {n}");
+    let info = PadInfo { bus: BUS_UNKNOWN, vendor: 0, product: 0, uid: fnv1a64(name.as_bytes()), name: Name::new(&name) };
     let start = std::time::Instant::now();
     let mut seq = 0u16;
+    let mut info_sent: Option<std::time::Instant> = None;
     loop {
+        if info_sent.map_or(true, |t| t.elapsed() >= INFO_EVERY) {
+            link.send_info(0, info);
+            info_sent = Some(std::time::Instant::now());
+        }
         let t = start.elapsed().as_secs_f32();
         let angle = t * std::f32::consts::TAU;
         let pad = PadState {
